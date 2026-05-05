@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Real-time packet capture module using Scapy
+Захватывает весь трафик (входящий и исходящий) для анализа
 """
 
 import sys
@@ -11,7 +12,7 @@ from datetime import datetime
 from scapy.all import sniff, IP, TCP, UDP, Raw
 
 class RealPacketCapture:
-    """Реальный захват сетевого трафика"""
+    """Реальный захват сетевого трафика (весь трафик)"""
     
     def __init__(self, packet_queue, log_callback=None):
         self.packet_queue = packet_queue
@@ -26,8 +27,43 @@ class RealPacketCapture:
             self.log_callback(f"[CAPTURE] {message}")
         print(f"[{level}] {message}")
     
+    def extract_http_payload(self, raw_data):
+        """
+        Извлечение HTTP payload из сырых данных
+        Возвращает строку с методом, URI и телом запроса
+        """
+        try:
+            # Пытаемся декодировать как UTF-8
+            payload = raw_data.decode('utf-8', errors='ignore')
+            
+            # Для HTTP запросов: ищем GET/POST/PUT/DELETE
+            http_methods = ['GET ', 'POST ', 'PUT ', 'DELETE ', 'HEAD ', 'OPTIONS ', 'PATCH ']
+            for method in http_methods:
+                if payload.startswith(method):
+                    # Находим конец первой строки (до \r\n)
+                    end_of_line = payload.find('\r\n')
+                    if end_of_line > 0:
+                        request_line = payload[:end_of_line]
+                        # Также захватываем тело, если есть
+                        body_start = payload.find('\r\n\r\n')
+                        if body_start > 0:
+                            body = payload[body_start+4:min(body_start+500, len(payload))]
+                            return f"{request_line}\n{body}"
+                        return request_line
+                    
+            # Для HTTP ответов: ищем статус код
+            if payload.startswith('HTTP/'):
+                end_of_line = payload.find('\r\n')
+                if end_of_line > 0:
+                    return payload[:end_of_line]
+            
+            # Если не HTTP, возвращаем первые 200 символов
+            return payload[:200]
+        except:
+            return str(raw_data)[:200]
+    
     def packet_handler(self, pkt):
-        """Обработчик одного пакета от scapy"""
+        """Обработчик одного пакета от scapy (анализирует весь трафик)"""
         if not self.sniffing:
             return
         
@@ -43,7 +79,8 @@ class RealPacketCapture:
             'protocol': None,
             'length': len(pkt) if pkt else 0,
             'payload': '',
-            'flags': None
+            'flags': None,
+            'direction': None  # 'in' или 'out' для определения направления
         }
         
         # IP-слой
@@ -52,38 +89,62 @@ class RealPacketCapture:
             packet_info['dst_ip'] = pkt[IP].dst
             packet_info['protocol'] = pkt[IP].proto
             
+            # Определяем направление (локальный IP vs внешний)
+            # Это нужно для правильного анализа атак
+            src_ip = packet_info['src_ip']
+            dst_ip = packet_info['dst_ip']
+            
+            # Проверяем, является ли IP локальным
+            is_local = lambda ip: ip.startswith(('10.', '192.168.', '172.', '127.'))
+            
+            if is_local(src_ip) and not is_local(dst_ip):
+                packet_info['direction'] = 'outgoing'  # Исходящий запрос (атака с твоего IP)
+            elif not is_local(src_ip) and is_local(dst_ip):
+                packet_info['direction'] = 'incoming'  # Входящий ответ
+            else:
+                packet_info['direction'] = 'unknown'
+            
             # TCP слой
             if pkt.haslayer(TCP):
                 packet_info['src_port'] = pkt[TCP].sport
                 packet_info['dst_port'] = pkt[TCP].dport
                 packet_info['flags'] = pkt[TCP].flags
                 
-                # Payload (только для HTTP портов)
-                if pkt.haslayer(Raw) and (pkt[TCP].dport in [80, 8080, 8000] or pkt[TCP].sport in [80, 8080, 8000]):
+                # Извлекаем payload из любого TCP пакета (не только HTTP)
+                if pkt.haslayer(Raw):
                     try:
-                        payload = bytes(pkt[Raw]).decode('utf-8', errors='ignore')
-                        # Ограничиваем размер для производительности
-                        packet_info['payload'] = payload[:500]
-                    except:
-                        packet_info['payload'] = str(pkt[Raw])[:500]
+                        raw_bytes = bytes(pkt[Raw])
+                        if raw_bytes:
+                            # Извлекаем HTTP-подобный payload
+                            packet_info['payload'] = self.extract_http_payload(raw_bytes)
+                    except Exception as e:
+                        packet_info['payload'] = f"[ERROR: {e}]"
             
             # UDP слой
             elif pkt.haslayer(UDP):
                 packet_info['src_port'] = pkt[UDP].sport
                 packet_info['dst_port'] = pkt[UDP].dport
                 if pkt.haslayer(Raw):
-                    packet_info['payload'] = str(pkt[Raw])[:200]
+                    try:
+                        raw_bytes = bytes(pkt[Raw])
+                        packet_info['payload'] = raw_bytes[:200].decode('utf-8', errors='ignore')
+                    except:
+                        packet_info['payload'] = str(pkt[Raw])[:200]
         
-        # Отправляем в очередь для анализа
-        if packet_info['src_ip']:  # Только если есть IP
+        # Отправляем в очередь для анализа, если есть IP и есть данные для анализа
+        if packet_info['src_ip'] and packet_info['payload']:
             try:
                 self.packet_queue.put(packet_info, timeout=0.1)
             except:
                 pass  # Очередь переполнена - пропускаем
             
-            # Логируем каждый 100-й пакет
+            # Логируем каждый 100-й пакет (только важные)
             if self.packet_count % 100 == 0:
-                self.log(f"Собрано {self.packet_count} пакетов. Последний: {packet_info['src_ip']} -> {packet_info['dst_ip']}")
+                direction = packet_info['direction']
+                if direction == 'outgoing':
+                    self.log(f"Собрано {self.packet_count} пакетов. Исходящий: {packet_info['src_ip']}:{packet_info['src_port']} -> {packet_info['dst_ip']}:{packet_info['dst_port']}")
+                else:
+                    self.log(f"Собрано {self.packet_count} пакетов. Входящий: {packet_info['src_ip']}:{packet_info['src_port']} -> {packet_info['dst_ip']}:{packet_info['dst_port']}")
     
     def start_capture(self, interface=None, filter_str=None):
         """Запуск захвата трафика в отдельном потоке"""
@@ -105,9 +166,10 @@ class RealPacketCapture:
             if not interface:
                 interface = 'eth0'
         
-        # BPF фильтр
+        # BPF фильтр для захвата TCP трафика на всех портах
+        # Убираем ограничение по портам, чтобы видеть весь трафик
         if not filter_str:
-            filter_str = "tcp or udp"
+            filter_str = "tcp"  # Захватываем весь TCP трафик для анализа атак
         
         self.log(f"Запуск захвата на интерфейсе {interface} с фильтром '{filter_str}'")
         

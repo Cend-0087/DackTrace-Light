@@ -6,17 +6,20 @@ Whitelist Manager for DarkTrace Light
 
 import json
 import threading
+import os
 from pathlib import Path
 
 class WhitelistManager:
     """Управление белым списком IP и сетей"""
     
     def __init__(self, whitelist_file="config/whitelist.json"):
+        # Определяем путь к файлу относительно текущего файла
         self.whitelist_file = Path(__file__).parent.parent / whitelist_file
-        self.whitelist_file.parent.mkdir(exist_ok=True)
-        self.whitelist_ips = set()      # Точные IP
-        self.whitelist_networks = set() # Префиксы сетей
+        self.whitelist_file.parent.mkdir(parents=True, exist_ok=True)
+        self.whitelist_ips = set()
+        self.whitelist_networks = set()
         self.lock = threading.Lock()
+        print(f"[WHITELIST] Файл: {self.whitelist_file}")
         self.load()
     
     def load(self):
@@ -31,13 +34,15 @@ class WhitelistManager:
                         data = json.load(f)
                         self.whitelist_ips = set(data.get('ips', []))
                         self.whitelist_networks = set(data.get('networks', []))
+                    print(f"[WHITELIST] Загружено {len(self.whitelist_ips)} IP и {len(self.whitelist_networks)} сетей")
                 except Exception as e:
                     print(f"[WHITELIST] Ошибка загрузки: {e}")
             
-            # Добавляем стандартные сети по умолчанию, если файл пустой
+            # Добавляем стандартные сети, если список пустой
             if not self.whitelist_ips and not self.whitelist_networks:
                 self.init_defaults()
                 self.save()
+                print(f"[WHITELIST] Инициализированы настройки по умолчанию")
     
     def init_defaults(self):
         """Инициализация белого списка по умолчанию"""
@@ -52,20 +57,20 @@ class WhitelistManager:
             '74.125.', '173.194.', '172.217.', '64.233.', '142.251.',
             '108.177.', '34.160.', '34.107.', '34.49.', '209.85.',
             # Akamai
-            '151.101.', '150.171.', '23.35.', '20.44.', '104.103.', '104.18.',
+            '151.101.', '150.171.', '23.35.', '20.44.', '104.103.',
             # Cloudflare
             '104.16.', '172.64.', '162.159.',
             # Microsoft Azure
-            '20.42.', '20.189.', '40.', '51.116.', '51.11.', '52.182.',
+            '20.42.', '20.189.', '51.116.', '51.11.', '52.182.',
             '13.107.', '13.33.',
             # AWS
-            '16.59.', '54.37.', '34.49.', '52.94.',
-            # Telia (магистральные сети)
+            '16.59.', '54.37.', '52.94.',
+            # Telia
             '62.115.', '80.239.',
             # Level 3
             '8.6.', '8.7.',
-            # Другие легитимные сервисы
-            '13.249.', '3.174.',
+            # Fastly
+            '151.101.',
         }
     
     def save(self):
@@ -77,6 +82,7 @@ class WhitelistManager:
                         'ips': list(self.whitelist_ips),
                         'networks': list(self.whitelist_networks)
                     }, f, indent=2)
+                print(f"[WHITELIST] Сохранено {len(self.whitelist_ips)} IP и {len(self.whitelist_networks)} сетей")
                 return True
             except Exception as e:
                 print(f"[WHITELIST] Ошибка сохранения: {e}")
@@ -88,11 +94,9 @@ class WhitelistManager:
             return False
         
         with self.lock:
-            # Проверка точного совпадения
             if ip in self.whitelist_ips:
                 return True
             
-            # Проверка по префиксам сетей
             for network in self.whitelist_networks:
                 if ip.startswith(network):
                     return True

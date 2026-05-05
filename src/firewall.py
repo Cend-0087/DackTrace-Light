@@ -1,13 +1,17 @@
+#!/usr/bin/env python3
+"""
+Firewall module for real IP blocking using iptables
+"""
+
 import subprocess
 import threading
 import time
-import os
 
 class Firewall:
     @staticmethod
     def block_ip(ip, duration_seconds=300):
         """Реальная блокировка IP через iptables"""
-        if ip.startswith('10.') or ip.startswith('192.168.') or ip.startswith('172.'):
+        if ip.startswith(('10.', '192.168.', '172.')):
             print(f"[FW] Пропускаем локальный IP: {ip}")
             return False
         
@@ -18,6 +22,7 @@ class Firewall:
                 shell=True
             )
             if check.returncode == 0:
+                print(f"[FW] IP {ip} уже заблокирован")
                 return True
             
             # Добавляем правило

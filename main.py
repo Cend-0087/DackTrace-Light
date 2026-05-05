@@ -11,29 +11,44 @@ import queue
 import time
 import os
 import sys
+import json
+import subprocess
+import socket
+import re
 from datetime import datetime
 import logging
 from pathlib import Path
+from collections import defaultdict
 
 # Настройка путей
 BASE_DIR = Path(__file__).parent
 LOG_DIR = BASE_DIR / "logs"
 DB_DIR = BASE_DIR / "database"
+CONFIG_DIR = BASE_DIR / "config"
 
 LOG_DIR.mkdir(exist_ok=True)
 DB_DIR.mkdir(exist_ok=True)
+CONFIG_DIR.mkdir(exist_ok=True)
 
 # Добавляем src в путь для импорта модулей
 sys.path.insert(0, str(BASE_DIR / "src"))
 
+print("[DEBUG] Инициализация модулей...")
+
 # Попытка импорта реального захвата
+REAL_CAPTURE_AVAILABLE = False
 try:
     from packet_capture import RealPacketCapture
     REAL_CAPTURE_AVAILABLE = True
     print("[OK] RealPacketCapture модуль загружен")
 except ImportError as e:
-    REAL_CAPTURE_AVAILABLE = False
     print(f"[WARN] RealPacketCapture не найден: {e}")
+
+# Белый список - ВКЛЮЧЁН
+WHITELIST_FILE = CONFIG_DIR / "whitelist.json"
+BLACKLIST_FILE = CONFIG_DIR / "blacklist.json"
+
+print("[DEBUG] Модули загружены, настройка логирования...")
 
 # Настройка логирования
 logging.basicConfig(
@@ -46,11 +61,155 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+print("[DEBUG] Логирование настроено, импорт sqlite3...")
+
+
+# ============================================================
+# КЛАСС БЕЛОГО СПИСКА
+# ============================================================
+
+class WhitelistManager:
+    def __init__(self, whitelist_file=WHITELIST_FILE):
+        self.whitelist_file = whitelist_file
+        self.ips = set()
+        self.networks = set()
+        self.load()
+    
+    def load(self):
+        if self.whitelist_file.exists():
+            try:
+                with open(self.whitelist_file, 'r') as f:
+                    data = json.load(f)
+                    self.ips = set(data.get('ips', []))
+                    self.networks = set(data.get('networks', []))
+                print(f"[WHITELIST] Загружено {len(self.ips)} IP и {len(self.networks)} сетей")
+                return
+            except:
+                pass
+        
+        # Значения по умолчанию
+        self.ips = {'8.8.8.8', '8.8.4.4', '1.1.1.1', '1.0.0.1'}
+        self.networks = {
+            '74.125.', '173.194.', '172.217.', '64.233.', '142.251.',
+            '108.177.', '34.160.', '34.107.', '151.101.', '150.171.',
+        }
+        self.save()
+    
+    def save(self):
+        try:
+            with open(self.whitelist_file, 'w') as f:
+                json.dump({'ips': list(self.ips), 'networks': list(self.networks)}, f, indent=2)
+            return True
+        except:
+            return False
+    
+    def is_whitelisted(self, ip):
+        if not ip:
+            return False
+        if ip in self.ips:
+            return True
+        for net in self.networks:
+            if ip.startswith(net):
+                return True
+        return False
+    
+    def add_ip(self, ip):
+        self.ips.add(ip)
+        return self.save()
+    
+    def remove_ip(self, ip):
+        if ip in self.ips:
+            self.ips.remove(ip)
+            return self.save()
+        return False
+    
+    def add_network(self, net):
+        if not net.endswith('.'):
+            net = net + '.'
+        self.networks.add(net)
+        return self.save()
+    
+    def remove_network(self, net):
+        if not net.endswith('.'):
+            net = net + '.'
+        if net in self.networks:
+            self.networks.remove(net)
+            return self.save()
+        return False
+    
+    def get_all(self):
+        return {'ips': list(self.ips), 'networks': list(self.networks)}
+
+
+# ============================================================
+# КЛАСС ЧЁРНОГО СПИСКА
+# ============================================================
+
+class BlacklistManager:
+    def __init__(self, blacklist_file=BLACKLIST_FILE):
+        self.blacklist_file = blacklist_file
+        self.ips = {}
+        self.load()
+    
+    def load(self):
+        if self.blacklist_file.exists():
+            try:
+                with open(self.blacklist_file, 'r') as f:
+                    data = json.load(f)
+                    self.ips = data.get('ips', {})
+                print(f"[BLACKLIST] Загружено {len(self.ips)} заблокированных IP")
+                return
+            except:
+                pass
+        self.save()
+    
+    def save(self):
+        try:
+            with open(self.blacklist_file, 'w') as f:
+                json.dump({'ips': self.ips}, f, indent=2)
+            return True
+        except:
+            return False
+    
+    def is_blocked(self, ip):
+        return ip in self.ips
+    
+    def add(self, ip, reason):
+        if ip in self.ips:
+            return
+        self.ips[ip] = {'reason': reason, 'blocked_at': datetime.now().isoformat()}
+        self.save()
+        # Реальная блокировка через iptables
+        try:
+            subprocess.run(f"iptables -I INPUT 1 -s {ip} -j DROP", shell=True, stderr=subprocess.DEVNULL)
+            subprocess.run(f"iptables -I OUTPUT 1 -d {ip} -j DROP", shell=True, stderr=subprocess.DEVNULL)
+            print(f"[FW] IP {ip} заблокирован в iptables (вход/выход)")
+        except Exception as e:
+            print(f"[FW] Ошибка блокировки: {e}")
+    
+    def remove(self, ip):
+        if ip in self.ips:
+            del self.ips[ip]
+            self.save()
+            # Реальная разблокировка через iptables
+            try:
+                subprocess.run(f"iptables -D INPUT -s {ip} -j DROP", shell=True, stderr=subprocess.DEVNULL)
+                subprocess.run(f"iptables -D OUTPUT -d {ip} -j DROP", shell=True, stderr=subprocess.DEVNULL)
+                print(f"[FW] IP {ip} разблокирован в iptables")
+            except:
+                pass
+            return True
+        return False
+    
+    def get_all(self):
+        return self.ips
+
 
 class Database:
     """Работа с SQLite базой данных"""
     
     def __init__(self, db_path="database/darktrace.db"):
+        print(f"[DEBUG] Инициализация БД: {db_path}")
         self.db_path = Path(__file__).parent / db_path
         self.db_path.parent.mkdir(exist_ok=True)
         self.init_tables()
@@ -69,72 +228,51 @@ class Database:
                     dst_port INTEGER,
                     protocol TEXT,
                     length INTEGER,
-                    payload TEXT
+                    payload TEXT,
+                    direction TEXT
                 );
                 
                 CREATE TABLE IF NOT EXISTS alerts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                     src_ip TEXT,
+                    dst_ip TEXT,
                     attack_type TEXT,
                     anomaly_score REAL,
-                    blocked INTEGER DEFAULT 1,
+                    blocked INTEGER DEFAULT 0,
                     packet_id INTEGER,
                     details TEXT
                 );
                 
-                CREATE TABLE IF NOT EXISTS blacklist (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ip TEXT UNIQUE,
-                    reason TEXT,
-                    blocked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    expires_at DATETIME
-                );
-                
                 CREATE INDEX IF NOT EXISTS idx_alerts_time ON alerts(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_packets_time ON packets(timestamp);
-                CREATE INDEX IF NOT EXISTS idx_blacklist_ip ON blacklist(ip);
+                CREATE INDEX IF NOT EXISTS idx_alerts_ip ON alerts(src_ip);
             ''')
     
     def log_packet(self, packet):
         import sqlite3
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.execute('''
-                INSERT INTO packets (src_ip, dst_ip, src_port, dst_port, protocol, length, payload)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO packets (src_ip, dst_ip, src_port, dst_port, protocol, length, payload, direction)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 RETURNING id
             ''', (
                 packet.get('src_ip'), packet.get('dst_ip'),
                 packet.get('src_port'), packet.get('dst_port'),
                 str(packet.get('protocol', '')),
                 packet.get('length', 0),
-                packet.get('payload', '')[:1000]
+                packet.get('payload', '')[:1000],
+                packet.get('direction', 'unknown')
             ))
             return cur.fetchone()[0]
     
-    def log_alert(self, src_ip, attack_type, score, packet_id=None, details=None):
+    def log_alert(self, src_ip, dst_ip, attack_type, score, packet_id=None, blocked=0, details=None):
         import sqlite3
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
-                INSERT INTO alerts (src_ip, attack_type, anomaly_score, packet_id, details)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (src_ip, attack_type, score, packet_id, details))
-    
-    def add_to_blacklist(self, ip, reason, duration_minutes=5):
-        import sqlite3
-        from datetime import datetime, timedelta
-        expires = datetime.now() + timedelta(minutes=duration_minutes)
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute('''
-                INSERT OR REPLACE INTO blacklist (ip, reason, expires_at)
-                VALUES (?, ?, ?)
-            ''', (ip, reason, expires))
-    
-    def get_blacklist(self):
-        import sqlite3
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute('SELECT ip FROM blacklist WHERE expires_at > datetime("now")')
-            return [row[0] for row in cur.fetchall()]
+                INSERT INTO alerts (src_ip, dst_ip, attack_type, anomaly_score, packet_id, blocked, details)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (src_ip, dst_ip, attack_type, score, packet_id, blocked, json.dumps(details) if details else None))
     
     def get_stats(self):
         import sqlite3
@@ -143,69 +281,195 @@ class Database:
                 SELECT 
                     (SELECT COUNT(*) FROM packets) as total_packets,
                     (SELECT COUNT(*) FROM alerts) as total_alerts,
-                    (SELECT COUNT(*) FROM alerts WHERE blocked=1) as blocked_count,
-                    (SELECT COUNT(*) FROM blacklist WHERE expires_at > datetime("now")) as active_blocks
+                    (SELECT COUNT(*) FROM alerts WHERE blocked=1) as blocked_count
             ''')
+            return cur.fetchone()
+    
+    def get_suspicious_ips_grouped(self):
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute('''
+                SELECT src_ip, attack_type, MAX(anomaly_score) as max_score, 
+                       COUNT(*) as attack_count, MAX(timestamp) as last_seen,
+                       GROUP_CONCAT(DISTINCT attack_type) as attack_types
+                FROM alerts 
+                WHERE timestamp > datetime('now', '-24 hours')
+                GROUP BY src_ip
+                ORDER BY max_score DESC
+            ''')
+            return [{'ip': r[0], 'type': r[1], 'score': r[2], 'count': r[3], 
+                     'last_seen': r[4], 'types': r[5]} for r in cur.fetchall()]
+    
+    def get_alerts_by_ip(self, ip, limit=100):
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute('''
+                SELECT timestamp, attack_type, anomaly_score, blocked, details, packet_id, dst_ip
+                FROM alerts WHERE src_ip = ? ORDER BY timestamp DESC LIMIT ?
+            ''', (ip, limit))
+            return cur.fetchall()
+    
+    def get_packet_by_id(self, packet_id):
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute('SELECT src_ip, dst_ip, src_port, dst_port, protocol, length, payload FROM packets WHERE id = ?', (packet_id,))
             return cur.fetchone()
 
 
+print("[DEBUG] Класс Database определён, создание основного класса DarkTraceLight...")
+
 import sqlite3
 
+
+# ============================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ IP ИНФОРМАЦИИ
+# ============================================================
+
+def get_ip_info(ip):
+    """Получение информации об IP без использования внешних API"""
+    info = {
+        'is_private': False,
+        'is_local': False,
+        'isp': 'Unknown',
+        'country': 'Unknown',
+        'rdns': None,
+        'is_suspicious': False,
+        'suspicious_reason': []
+    }
+    
+    # Проверка на приватные IP
+    private_ranges = [
+        ('10.', 'Private'),
+        ('192.168.', 'Private'),
+        ('172.16.', 'Private'), ('172.17.', 'Private'), ('172.18.', 'Private'),
+        ('172.19.', 'Private'), ('172.20.', 'Private'), ('172.21.', 'Private'),
+        ('172.22.', 'Private'), ('172.23.', 'Private'), ('172.24.', 'Private'),
+        ('172.25.', 'Private'), ('172.26.', 'Private'), ('172.27.', 'Private'),
+        ('172.28.', 'Private'), ('172.29.', 'Private'), ('172.30.', 'Private'),
+        ('172.31.', 'Private'),
+        ('127.', 'Loopback'),
+        ('0.', 'Invalid'),
+        ('224.', 'Multicast'),
+        ('240.', 'Reserved'),
+        ('255.255.255.255', 'Broadcast'),
+    ]
+    
+    for prefix, desc in private_ranges:
+        if ip.startswith(prefix) or ip == '255.255.255.255':
+            info['is_private'] = True
+            info['is_local'] = True
+            info['isp'] = desc
+            return info
+    
+    # Попытка обратного DNS запроса
+    try:
+        info['rdns'] = socket.gethostbyaddr(ip)[0]
+    except:
+        pass
+    
+    # Определение ISP по ASN (без внешних запросов)
+    known_ips = {
+        '8.8.8.8': 'Google (Public DNS)',
+        '8.8.4.4': 'Google (Public DNS)',
+        '1.1.1.1': 'Cloudflare (Public DNS)',
+        '1.0.0.1': 'Cloudflare (Public DNS)',
+        '9.9.9.9': 'Quad9 (Public DNS)',
+        '208.67.222.222': 'OpenDNS',
+        '208.67.220.220': 'OpenDNS',
+    }
+    
+    for known_ip, name in known_ips.items():
+        if ip == known_ip or ip.startswith(known_ip.rstrip('.')):
+            info['isp'] = name
+            return info
+    
+    # Определение по первым октетам
+    if ip.startswith('151.101.'):
+        info['isp'] = 'Fastly (CDN)'
+    elif ip.startswith('74.125.') or ip.startswith('173.194.') or ip.startswith('172.217.'):
+        info['isp'] = 'Google (CDN)'
+    elif ip.startswith('104.16.') or ip.startswith('172.64.'):
+        info['isp'] = 'Cloudflare (CDN)'
+    elif ip.startswith('20.'):
+        info['isp'] = 'Microsoft / Azure'
+    elif ip.startswith('34.'):
+        info['isp'] = 'Google Cloud / Oracle Cloud'
+    elif ip.startswith('52.'):
+        info['isp'] = 'Amazon AWS / Microsoft'
+    elif ip.startswith('13.'):
+        info['isp'] = 'Amazon AWS / Microsoft'
+    else:
+        info['isp'] = 'Unknown'
+        info['is_suspicious'] = True
+        info['suspicious_reason'].append('Неизвестный провайдер')
+    
+    return info
+
+
+# ============================================================
+# ГЛАВНЫЙ КЛАСС ПРИЛОЖЕНИЯ
+# ============================================================
 
 class DarkTraceLight:
     """Главный класс приложения"""
     
     def __init__(self, root):
+        print("[DEBUG] DarkTraceLight.__init__ начат")
         self.root = root
         self.root.title("DarkTrace Light - Network Anomaly Detection")
-        self.root.geometry("1200x700")
+        self.root.geometry("1300x750")
         self.root.configure(bg='#1e1e1e')
         
-        # Инициализация БД
+        print("[DEBUG] Инициализация БД...")
         self.db = Database()
         
-        # Настройка стилей для тёмной темы
+        print("[DEBUG] Инициализация белого списка...")
+        self.whitelist = WhitelistManager()
+        
+        print("[DEBUG] Инициализация чёрного списка...")
+        self.blacklist = BlacklistManager()
+        
+        print("[DEBUG] Настройка стилей...")
         self.setup_styles()
         
-        # Очереди для потоков
+        print("[DEBUG] Инициализация очередей...")
         self.packet_queue = queue.Queue(maxsize=1000)
-        self.alert_queue = queue.Queue()
         
-        # Флаги состояния
+        print("[DEBUG] Инициализация флагов...")
         self.monitoring = False
         self.capture_thread = None
         self.analysis_thread = None
         self.capture = None
         self.anomaly_detector = None
         
-        # Счётчики для статистики
-        self.stats = {
-            'packets_total': 0,
-            'anomalies_detected': 0,
-            'attacks_blocked': 0,
-            'blacklisted_ips': set()
-        }
+        # Флаги для обновления таблиц
+        self._refresh_alerts_needed = False
+        self._refresh_whitelist_needed = False
+        self._refresh_blacklist_needed = False
+        self._alerts_data = None
+        self._whitelist_data = None
+        self._blacklist_data = None
         
-        # Создание GUI
+        print("[DEBUG] Создание GUI...")
         self.setup_gui()
         
-        # Запуск обновления интерфейса
+        print("[DEBUG] Запуск обновления интерфейса...")
         self.update_gui()
         
-        # Проверка прав
+        print("[DEBUG] Проверка прав...")
         self.check_permissions()
         
-        # Загрузка ML модели
+        print("[DEBUG] Загрузка ML модели...")
         self.init_ml_model()
         
+        print("[DEBUG] DarkTrace Light инициализирован")
         logger.info("DarkTrace Light инициализирован")
     
     def init_ml_model(self):
         """Инициализация ML модели"""
         try:
             from anomaly_detector import AnomalyDetector
-            self.anomaly_detector = AnomalyDetector(contamination=0.02)  # Только 2% аномалий
-            # Пытаемся загрузить существующую модель
+            self.anomaly_detector = AnomalyDetector(contamination=0.01)
             if self.anomaly_detector.load_model():
                 self.log_message("[ML] Модель загружена. Режим детектирования.", "green")
             else:
@@ -225,129 +489,22 @@ class DarkTraceLight:
         style.map('TButton', background=[('active', '#1177bb')])
         style.configure('TNotebook', background='#1e1e1e')
         style.configure('TNotebook.Tab', background='#2d2d2d', foreground='#ffffff')
+        style.configure('Treeview', background='#2d2d2d', foreground='#ffffff', fieldbackground='#2d2d2d')
+        style.configure('Treeview.Heading', background='#3c3c3c', foreground='#ffffff')
     
-    def setup_whitelist_tab(self):
-        """Настройка вкладки с белым списком"""
-        self.whitelist_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.whitelist_frame, text="Whitelist")
-
-        # Верхняя панель с кнопками добавления
-        add_frame = ttk.LabelFrame(self.whitelist_frame, text="Add to Whitelist", padding=5)
-        add_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        ttk.Label(add_frame, text="IP Address:").grid(row=0, column=0, padx=5, pady=5)
-        self.whitelist_ip_entry = ttk.Entry(add_frame, width=20)
-        self.whitelist_ip_entry.grid(row=0, column=1, padx=5, pady=5)
-        ttk.Button(add_frame, text="Add IP", command=self.add_ip_to_whitelist).grid(row=0, column=2, padx=5, pady=5)
-
-        ttk.Label(add_frame, text="Network Prefix:").grid(row=1, column=0, padx=5, pady=5)
-        self.whitelist_network_entry = ttk.Entry(add_frame, width=20)
-        self.whitelist_network_entry.grid(row=1, column=1, padx=5, pady=5)
-        ttk.Button(add_frame, text="Add Network", command=self.add_network_to_whitelist).grid(row=1, column=2, padx=5, pady=5)
-
-        # Таблица для отображения белого списка
-        columns = ('Type', 'Value', 'Actions')
-        self.whitelist_tree = ttk.Treeview(self.whitelist_frame, columns=columns, show='headings', height=15)
-
-        self.whitelist_tree.heading('Type', text='Type')
-        self.whitelist_tree.heading('Value', text='Value')
-        self.whitelist_tree.heading('Actions', text='Actions')
-
-        self.whitelist_tree.column('Type', width=100)
-        self.whitelist_tree.column('Value', width=400)
-        self.whitelist_tree.column('Actions', width=100)
-
-        self.whitelist_tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        # Кнопка обновления
-        refresh_btn = ttk.Button(self.whitelist_frame, text="Refresh", command=self.refresh_whitelist)
-        refresh_btn.pack(pady=5)
-
-        # Инициализация менеджера белого списка
-        from whitelist import WhitelistManager
-        self.whitelist_manager = WhitelistManager()
-        self.refresh_whitelist()
-
-    def add_ip_to_whitelist(self):
-        """Добавление IP в белый список"""
-        ip = self.whitelist_ip_entry.get().strip()
-        if not ip:
-            messagebox.showwarning("Warning", "Введите IP адрес")
-            return
-        
-        if self.whitelist_manager.add_ip(ip):
-            self.log_message(f"[WHITELIST] IP {ip} добавлен в белый список", "green")
-            self.whitelist_ip_entry.delete(0, tk.END)
-            self.refresh_whitelist()
-        else:
-            messagebox.showerror("Error", "Не удалось добавить IP")
-    
-    def add_network_to_whitelist(self):
-        """Добавление сети в белый список"""
-        network = self.whitelist_network_entry.get().strip()
-        if not network:
-            messagebox.showwarning("Warning", "Введите префикс сети (например, 192.168.)")
-            return
-        
-        if self.whitelist_manager.add_network(network):
-            self.log_message(f"[WHITELIST] Сеть {network} добавлена в белый список", "green")
-            self.whitelist_network_entry.delete(0, tk.END)
-            self.refresh_whitelist()
-        else:
-            messagebox.showerror("Error", "Не удалось добавить сеть")
-    
-    def remove_from_whitelist(self, value, item_type):
-        """Удаление из белого списка"""
-        if item_type == "IP":
-            if self.whitelist_manager.remove_ip(value):
-                self.log_message(f"[WHITELIST] IP {value} удалён из белого списка", "yellow")
-                self.refresh_whitelist()
-        elif item_type == "Network":
-            if self.whitelist_manager.remove_network(value.rstrip('.')):
-                self.log_message(f"[WHITELIST] Сеть {value} удалена из белого списка", "yellow")
-                self.refresh_whitelist()
-    
-    def refresh_whitelist(self):
-        """Обновление отображения белого списка"""
-        # Очищаем таблицу
-        for item in self.whitelist_tree.get_children():
-            self.whitelist_tree.delete(item)
-        
-        data = self.whitelist_manager.get_all()
-        
-        # Добавляем IP
-        for ip in data['ips']:
-            item = self.whitelist_tree.insert('', 'end', values=('IP', ip, '✖'))
-            self.whitelist_tree.set(item, 'Actions', '✖')
-        
-        # Добавляем сети
-        for network in data['networks']:
-            item = self.whitelist_tree.insert('', 'end', values=('Network', network, '✖'))
-            self.whitelist_tree.set(item, 'Actions', '✖')
-        
-        # Назначаем обработчик клика для удаления
-        self.whitelist_tree.bind('<ButtonRelease-1>', self.on_whitelist_click)
-    
-    def on_whitelist_click(self, event):
-        """Обработка клика по элементу белого списка"""
-        region = self.whitelist_tree.identify_region(event.x, event.y)
-        if region == 'cell':
-            column = self.whitelist_tree.identify_column(event.x)
-            if column == '#3':  # Колонка Actions
-                item = self.whitelist_tree.identify_row(event.y)
-                if item:
-                    values = self.whitelist_tree.item(item, 'values')
-                    if values and len(values) >= 2:
-                        item_type = values[0]
-                        value = values[1]
-                        if messagebox.askyesno("Confirm", f"Remove {value} from whitelist?"):
-                            self.remove_from_whitelist(value, item_type)
-
     def setup_gui(self):
         """Создание графического интерфейса"""
-        # Верхняя панель с кнопками
-        control_frame = ttk.Frame(self.root)
+        print("[DEBUG] setup_gui начат")
+        
+        # Основной контейнер
+        main_container = ttk.Frame(self.root)
+        main_container.pack(fill=tk.BOTH, expand=True)
+        
+        # Верхняя панель
+        control_frame = ttk.Frame(main_container)
         control_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        print("[DEBUG] Создание кнопок управления...")
         
         self.start_btn = ttk.Button(control_frame, text="▶ Start Monitoring", command=self.start_monitoring)
         self.start_btn.pack(side=tk.LEFT, padx=5)
@@ -382,14 +539,16 @@ class DarkTraceLight:
         self.packets_label = ttk.Label(stats_frame, text="Packets: 0")
         self.packets_label.pack(side=tk.LEFT, padx=5)
         
-        self.alerts_label = ttk.Label(stats_frame, text="Alerts: 0", foreground="orange")
+        self.alerts_label = ttk.Label(stats_frame, text="Suspicious IPs: 0", foreground="orange")
         self.alerts_label.pack(side=tk.LEFT, padx=5)
         
         self.blocked_label = ttk.Label(stats_frame, text="Blocked: 0", foreground="red")
         self.blocked_label.pack(side=tk.LEFT, padx=5)
         
-        # Notebook (вкладки)
-        self.notebook = ttk.Notebook(self.root)
+        print("[DEBUG] Создание вкладок...")
+        
+        # Вкладки
+        self.notebook = ttk.Notebook(main_container)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
         # Вкладка 1: Логи
@@ -397,22 +556,27 @@ class DarkTraceLight:
         self.notebook.add(self.log_frame, text="Live Logs")
         self.setup_log_tab()
         
-        # Вкладка 2: Алерты
+        # Вкладка 2: Подозрительные IP
         self.alerts_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.alerts_frame, text="Alerts")
+        self.notebook.add(self.alerts_frame, text="Suspicious IPs")
         self.setup_alerts_tab()
         
-        # Вкладка 3: Статистика
-        self.stats_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.stats_frame, text="Statistics")
-        self.setup_stats_tab()
+        # Вкладка 3: Белый список
+        self.whitelist_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.whitelist_frame, text="Whitelist")
+        self.setup_whitelist_tab()
         
         # Вкладка 4: Чёрный список
         self.blacklist_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.blacklist_frame, text="Blacklist")
         self.setup_blacklist_tab()
-
-        self.setup_whitelist_tab()
+        
+        # Вкладка 5: Статистика
+        self.stats_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.stats_frame, text="Statistics")
+        self.setup_stats_tab()
+        
+        print("[DEBUG] setup_gui завершён")
     
     def setup_log_tab(self):
         """Настройка вкладки с логами"""
@@ -428,18 +592,91 @@ class DarkTraceLight:
         clear_btn.pack(pady=5)
     
     def setup_alerts_tab(self):
-        """Настройка вкладки с алертами"""
-        columns = ('Time', 'Source IP', 'Attack Type', 'Status', 'Anomaly Score')
-        self.alerts_tree = ttk.Treeview(self.alerts_frame, columns=columns, show='headings')
+        """Настройка вкладки с группированными подозрительными IP"""
+        columns = ('Source IP', 'Attack Type', 'Score', 'Count', 'Last Seen')
+        self.alerts_tree = ttk.Treeview(self.alerts_frame, columns=columns, show='headings', height=20)
         
-        for col in columns:
-            self.alerts_tree.heading(col, text=col)
-            self.alerts_tree.column(col, width=150)
+        self.alerts_tree.heading('Source IP', text='Source IP')
+        self.alerts_tree.heading('Attack Type', text='Attack Type')
+        self.alerts_tree.heading('Score', text='Score')
+        self.alerts_tree.heading('Count', text='Count')
+        self.alerts_tree.heading('Last Seen', text='Last Seen')
         
-        self.alerts_tree.pack(fill=tk.BOTH, expand=True)
+        self.alerts_tree.column('Source IP', width=140)
+        self.alerts_tree.column('Attack Type', width=120)
+        self.alerts_tree.column('Score', width=80)
+        self.alerts_tree.column('Count', width=60)
+        self.alerts_tree.column('Last Seen', width=150)
         
-        export_btn = ttk.Button(self.alerts_frame, text="Export to CSV", command=self.export_alerts)
-        export_btn.pack(pady=5)
+        self.alerts_tree.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        # Кнопки управления
+        btn_frame = ttk.Frame(self.alerts_frame)
+        btn_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Button(btn_frame, text="🔍 Details", command=self.view_alert_details).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="🚫 Block IP", command=self.block_selected_ip).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="✅ Add to Whitelist", command=self.add_selected_to_whitelist).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="🔄 Refresh", command=self.force_refresh_alerts).pack(side=tk.LEFT, padx=5)
+        
+        self.alerts_tree.bind('<Double-1>', lambda e: self.view_alert_details())
+    
+    def setup_whitelist_tab(self):
+        """Настройка вкладки с белым списком"""
+        add_frame = ttk.LabelFrame(self.whitelist_frame, text="Add to Whitelist", padding=5)
+        add_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        ttk.Label(add_frame, text="IP Address:").grid(row=0, column=0, padx=5, pady=5)
+        self.whitelist_ip_entry = ttk.Entry(add_frame, width=25)
+        self.whitelist_ip_entry.grid(row=0, column=1, padx=5, pady=5)
+        ttk.Button(add_frame, text="Add IP", command=self.add_ip_to_whitelist).grid(row=0, column=2, padx=5, pady=5)
+        
+        ttk.Label(add_frame, text="Network Prefix:").grid(row=1, column=0, padx=5, pady=5)
+        self.whitelist_network_entry = ttk.Entry(add_frame, width=25)
+        self.whitelist_network_entry.grid(row=1, column=1, padx=5, pady=5)
+        ttk.Button(add_frame, text="Add Network", command=self.add_network_to_whitelist).grid(row=1, column=2, padx=5, pady=5)
+        
+        columns = ('Type', 'Value')
+        self.whitelist_tree = ttk.Treeview(self.whitelist_frame, columns=columns, show='headings', height=15)
+        
+        self.whitelist_tree.heading('Type', text='Type')
+        self.whitelist_tree.heading('Value', text='Value')
+        
+        self.whitelist_tree.column('Type', width=100)
+        self.whitelist_tree.column('Value', width=400)
+        
+        self.whitelist_tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        btn_frame = ttk.Frame(self.whitelist_frame)
+        btn_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Button(btn_frame, text="Remove Selected", command=self.remove_from_whitelist).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Refresh", command=self.force_refresh_whitelist).pack(side=tk.LEFT, padx=5)
+        
+        self.force_refresh_whitelist()
+    
+    def setup_blacklist_tab(self):
+        """Настройка вкладки с чёрным списком"""
+        columns = ('IP Address', 'Reason', 'Blocked At')
+        self.blacklist_tree = ttk.Treeview(self.blacklist_frame, columns=columns, show='headings', height=20)
+        
+        self.blacklist_tree.heading('IP Address', text='IP Address')
+        self.blacklist_tree.heading('Reason', text='Reason')
+        self.blacklist_tree.heading('Blocked At', text='Blocked At')
+        
+        self.blacklist_tree.column('IP Address', width=150)
+        self.blacklist_tree.column('Reason', width=250)
+        self.blacklist_tree.column('Blocked At', width=200)
+        
+        self.blacklist_tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        btn_frame = ttk.Frame(self.blacklist_frame)
+        btn_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Button(btn_frame, text="Unblock Selected IP", command=self.unblock_ip).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Refresh", command=self.force_refresh_blacklist).pack(side=tk.LEFT, padx=5)
+        
+        self.force_refresh_blacklist()
     
     def setup_stats_tab(self):
         """Настройка вкладки со статистикой"""
@@ -451,19 +688,262 @@ class DarkTraceLight:
         
         self.update_stats_display()
     
-    def setup_blacklist_tab(self):
-        """Настройка вкладки с чёрным списком"""
-        columns = ('IP Address', 'Reason', 'Blocked At')
-        self.blacklist_tree = ttk.Treeview(self.blacklist_frame, columns=columns, show='headings')
+    # ==================== МЕТОДЫ БЕЛОГО СПИСКА ====================
+    
+    def add_ip_to_whitelist(self):
+        ip = self.whitelist_ip_entry.get().strip()
+        if not ip:
+            messagebox.showwarning("Warning", "Введите IP адрес")
+            return
+        if self.whitelist.add_ip(ip):
+            self.log_message(f"[WHITELIST] IP {ip} добавлен", "green")
+            self.whitelist_ip_entry.delete(0, tk.END)
+            self.force_refresh_whitelist()
+    
+    def add_network_to_whitelist(self):
+        net = self.whitelist_network_entry.get().strip()
+        if not net:
+            messagebox.showwarning("Warning", "Введите префикс сети")
+            return
+        if self.whitelist.add_network(net):
+            self.log_message(f"[WHITELIST] Сеть {net} добавлена", "green")
+            self.whitelist_network_entry.delete(0, tk.END)
+            self.force_refresh_whitelist()
+    
+    def remove_from_whitelist(self):
+        selected = self.whitelist_tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "Выберите элемент для удаления")
+            return
+        for item in selected:
+            values = self.whitelist_tree.item(item, 'values')
+            if values and values[0] == 'IP':
+                self.whitelist.remove_ip(values[1])
+                self.log_message(f"[WHITELIST] IP {values[1]} удалён", "yellow")
+            elif values and values[0] == 'Network':
+                self.whitelist.remove_network(values[1].rstrip('.'))
+                self.log_message(f"[WHITELIST] Сеть {values[1]} удалена", "yellow")
+        self.force_refresh_whitelist()
+    
+    def force_refresh_whitelist(self):
+        """Принудительное обновление таблицы"""
+        for item in self.whitelist_tree.get_children():
+            self.whitelist_tree.delete(item)
+        data = self.whitelist.get_all()
+        for ip in data['ips']:
+            self.whitelist_tree.insert('', 'end', values=('IP', ip))
+        for net in data['networks']:
+            self.whitelist_tree.insert('', 'end', values=('Network', net))
+    
+    def add_selected_to_whitelist(self):
+        """Добавление выбранного IP из таблицы алертов в белый список"""
+        selected = self.alerts_tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "Выберите IP для добавления в белый список")
+            return
+        values = self.alerts_tree.item(selected[0], 'values')
+        ip = values[0]
+        if self.whitelist.add_ip(ip):
+            self.log_message(f"[WHITELIST] IP {ip} добавлен в белый список из алертов", "green")
+            self.force_refresh_whitelist()
+            self.force_refresh_alerts()
+    
+    # ==================== МЕТОДЫ АЛЕРТОВ ====================
+    
+    def force_refresh_alerts(self):
+        """Принудительное обновление таблицы"""
+        for item in self.alerts_tree.get_children():
+            self.alerts_tree.delete(item)
         
-        for col in columns:
-            self.blacklist_tree.heading(col, text=col)
-            self.blacklist_tree.column(col, width=200)
+        suspicious_ips = self.db.get_suspicious_ips_grouped()
+        self.alerts_label.config(text=f"Suspicious IPs: {len(suspicious_ips)}")
         
-        self.blacklist_tree.pack(fill=tk.BOTH, expand=True)
+        for ip in suspicious_ips:
+            last_seen = ip['last_seen'][:19] if ip['last_seen'] else ''
+            self.alerts_tree.insert('', 'end', values=(
+                ip['ip'], ip['type'], f"{ip['score']:.3f}", ip['count'], last_seen
+            ))
+    
+    def force_refresh_blacklist(self):
+        """Принудительное обновление таблицы чёрного списка"""
+        for item in self.blacklist_tree.get_children():
+            self.blacklist_tree.delete(item)
         
-        unblock_btn = ttk.Button(self.blacklist_frame, text="Unblock Selected IP", command=self.unblock_ip)
-        unblock_btn.pack(pady=5)
+        for ip, data in self.blacklist.get_all().items():
+            blocked_at = data.get('blocked_at', '')[:19]
+            self.blacklist_tree.insert('', 'end', values=(ip, data['reason'], blocked_at))
+        
+        self.blocked_label.config(text=f"Blocked: {len(self.blacklist.get_all())}")
+    
+    def get_ip_additional_info(self, ip):
+        """Получение дополнительной информации об IP"""
+        info = get_ip_info(ip)
+        
+        alerts = self.db.get_alerts_by_ip(ip, limit=5)
+        
+        lines = []
+        lines.append(f"IP: {ip}")
+        lines.append(f"Тип: {'Приватный / Локальный' if info['is_private'] else 'Публичный'}")
+        lines.append(f"Провайдер/Владелец: {info['isp']}")
+        
+        if info['rdns']:
+            lines.append(f"Reverse DNS: {info['rdns']}")
+        
+        if info['is_suspicious']:
+            lines.append(f"⚠️ Подозрительный: {', '.join(info['suspicious_reason'])}")
+        
+        lines.append("")
+        lines.append(f"📊 Статистика атак:")
+        lines.append(f"   Всего алертов: {len(alerts)}")
+        
+        attack_counts = defaultdict(int)
+        for alert in alerts:
+            attack_counts[alert[1]] += 1
+        
+        if attack_counts:
+            lines.append("   Типы атак:")
+            for attack_type, count in sorted(attack_counts.items(), key=lambda x: -x[1]):
+                lines.append(f"      - {attack_type}: {count} раз(а)")
+        
+        return "\n".join(lines)
+    
+    def view_alert_details(self):
+        """Просмотр деталей алертов для выбранного IP"""
+        selected = self.alerts_tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "Выберите IP для просмотра деталей")
+            return
+        
+        values = self.alerts_tree.item(selected[0], 'values')
+        ip = values[0]
+        
+        alerts = self.db.get_alerts_by_ip(ip)
+        if not alerts:
+            messagebox.showinfo("Info", f"Нет деталей для IP {ip}")
+            return
+        
+        detail_window = tk.Toplevel(self.root)
+        detail_window.title(f"IP Details - {ip}")
+        detail_window.geometry("800x600")
+        detail_window.configure(bg='#1e1e1e')
+        
+        text_widget = scrolledtext.ScrolledText(
+            detail_window, bg='#1e1e1e', fg='#00ff00', font=('Consolas', 10)
+        )
+        text_widget.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        text_widget.insert(tk.END, f"{'='*70}\n")
+        text_widget.insert(tk.END, f"ИНФОРМАЦИЯ ОБ IP: {ip}\n")
+        text_widget.insert(tk.END, f"{'='*70}\n\n")
+        
+        ip_info = self.get_ip_additional_info(ip)
+        text_widget.insert(tk.END, ip_info)
+        text_widget.insert(tk.END, f"\n\n{'='*70}\n")
+        text_widget.insert(tk.END, f"ДЕТАЛИ АТАК (последние 30)\n")
+        text_widget.insert(tk.END, f"{'='*70}\n\n")
+        
+        for alert in alerts[:30]:
+            timestamp, attack_type, score, blocked, details, packet_id, dst_ip = alert
+            text_widget.insert(tk.END, f"┌────────────────────────────────────────────────────────────────────┐\n")
+            text_widget.insert(tk.END, f"│ Время:      {timestamp}\n")
+            text_widget.insert(tk.END, f"│ Тип атаки:  {attack_type}\n")
+            text_widget.insert(tk.END, f"│ Score:      {score:.4f}\n")
+            text_widget.insert(tk.END, f"│ Цель:       {dst_ip}\n")
+            text_widget.insert(tk.END, f"│ Заблокирован: {'ДА' if blocked else 'НЕТ'}\n")
+            
+            if packet_id:
+                packet = self.db.get_packet_by_id(packet_id)
+                if packet:
+                    text_widget.insert(tk.END, f"│ Пакет:      {packet[0]} -> {packet[1]} (порт: {packet[3]})\n")
+                    text_widget.insert(tk.END, f"│ Размер:     {packet[4]} bytes\n")
+                    if packet[6]:
+                        payload_preview = packet[6][:150] + "..." if len(packet[6]) > 150 else packet[6]
+                        text_widget.insert(tk.END, f"│ Payload:    {payload_preview}\n")
+            
+            text_widget.insert(tk.END, f"└────────────────────────────────────────────────────────────────────┘\n\n")
+        
+        text_widget.configure(state='disabled')
+        
+        btn_frame = ttk.Frame(detail_window)
+        btn_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        if not self.blacklist.is_blocked(ip):
+            ttk.Button(btn_frame, text="🚫 Block This IP", 
+                      command=lambda: self.block_ip_direct(ip, detail_window)).pack(side=tk.LEFT, padx=5)
+        else:
+            ttk.Button(btn_frame, text="🔓 Unblock This IP", 
+                      command=lambda: self.unblock_ip_direct(ip, detail_window)).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(btn_frame, text="✅ Add to Whitelist", 
+                  command=lambda: self.whitelist_add_ip_direct(ip, detail_window)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Close", command=detail_window.destroy).pack(side=tk.RIGHT, padx=5)
+    
+    def block_selected_ip(self):
+        """Блокировка выбранного IP из таблицы алертов"""
+        selected = self.alerts_tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "Выберите IP для блокировки")
+            return
+        values = self.alerts_tree.item(selected[0], 'values')
+        ip = values[0]
+        self.block_ip_direct(ip)
+    
+    def block_ip_direct(self, ip, window_to_close=None):
+        """Постоянная блокировка IP"""
+        if ip.startswith(('10.', '192.168.', '172.', '127.')):
+            self.log_message(f"[BLOCK] IP {ip} локальный, блокировка не выполнена", "yellow")
+            messagebox.showwarning("Warning", f"IP {ip} локальный. Блокировка не выполняется.")
+            return
+        
+        if self.blacklist.is_blocked(ip):
+            self.log_message(f"[BLOCK] IP {ip} уже в чёрном списке", "yellow")
+            if window_to_close:
+                window_to_close.destroy()
+            return
+        
+        self.blacklist.add(ip, "Заблокирован пользователем")
+        self.log_message(f"[BLOCK] IP {ip} заблокирован", "red")
+        self.force_refresh_blacklist()
+        self.force_refresh_alerts()
+        
+        if window_to_close:
+            window_to_close.destroy()
+        
+        messagebox.showinfo("Blocked", f"IP {ip} заблокирован.")
+    
+    def unblock_ip_direct(self, ip, window_to_close=None):
+        """Разблокировка IP"""
+        if self.blacklist.remove(ip):
+            self.log_message(f"[BLOCK] IP {ip} разблокирован", "green")
+            self.force_refresh_blacklist()
+            self.force_refresh_alerts()
+            if window_to_close:
+                window_to_close.destroy()
+    
+    def whitelist_add_ip_direct(self, ip, window_to_close=None):
+        """Добавление IP в белый список"""
+        if self.whitelist.add_ip(ip):
+            self.log_message(f"[WHITELIST] IP {ip} добавлен в белый список", "green")
+            self.force_refresh_whitelist()
+            self.force_refresh_alerts()
+            messagebox.showinfo("Success", f"IP {ip} добавлен в белый список")
+        if window_to_close:
+            window_to_close.destroy()
+    
+    def unblock_ip(self):
+        """Разблокировка выбранного IP из таблицы чёрного списка"""
+        selected = self.blacklist_tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "Выберите IP для разблокировки")
+            return
+        
+        values = self.blacklist_tree.item(selected[0], 'values')
+        ip = values[0]
+        
+        if self.blacklist.remove(ip):
+            self.log_message(f"[BLOCK] IP {ip} разблокирован", "green")
+            self.force_refresh_blacklist()
+            self.force_refresh_alerts()
     
     def check_permissions(self):
         """Проверка прав для захвата трафика"""
@@ -487,23 +967,11 @@ class DarkTraceLight:
         self.log_text.delete(1.0, tk.END)
         self.log_message("[INFO] Логи очищены", "gray")
     
-    def export_alerts(self):
-        """Экспорт алертов в CSV"""
-        filename = f"alerts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        try:
-            with open(filename, 'w') as f:
-                f.write("Time,Source IP,Attack Type,Status,Anomaly Score\n")
-                for item in self.alerts_tree.get_children():
-                    values = self.alerts_tree.item(item)['values']
-                    f.write(f"{values[0]},{values[1]},{values[2]},{values[3]},{values[4]}\n")
-            self.log_message(f"[INFO] Экспортировано {len(self.alerts_tree.get_children())} алертов в {filename}", "green")
-            messagebox.showinfo("Export", f"Exported to {filename}")
-        except Exception as e:
-            self.log_message(f"[ERROR] Ошибка экспорта: {e}", "red")
-    
     def update_stats_display(self):
         """Обновление отображения статистики"""
         db_stats = self.db.get_stats()
+        wl_data = self.whitelist.get_all()
+        bl_count = len(self.blacklist.get_all())
         
         ml_status = "ACTIVE" if self.anomaly_detector and self.anomaly_detector.is_trained else "COLLECTING"
         
@@ -513,8 +981,10 @@ class DarkTraceLight:
 ╠══════════════════════════════════════════════╣
 ║ Total Packets:        {db_stats[0]:<30} ║
 ║ Total Alerts:         {db_stats[1]:<30} ║
-║ Attacks Blocked:      {db_stats[2]:<30} ║
-║ Active Blocks:        {db_stats[3]:<30} ║
+║ Blocked IPs:          {bl_count:<30} ║
+╠══════════════════════════════════════════════╣
+║ Whitelist IPs:        {len(wl_data['ips']):<30} ║
+║ Whitelist Networks:   {len(wl_data['networks']):<30} ║
 ╠══════════════════════════════════════════════╣
 ║ ML Status:            {ml_status:<30} ║
 ║ Mode:                 {self.ml_mode_var.get():<30} ║
@@ -526,67 +996,32 @@ class DarkTraceLight:
         self.stats_text.delete(1.0, tk.END)
         self.stats_text.insert(1.0, stats_text)
         
-        if self.monitoring:
-            self.root.after(2000, self.update_stats_display)
+        self.root.after(3000, self.update_stats_display)
     
-    def unblock_ip(self):
-        """Разблокировка выбранного IP"""
-        selected = self.blacklist_tree.selection()
-        if not selected:
-            messagebox.showwarning("Warning", "Выберите IP для разблокировки")
+    def add_alert_and_block(self, src_ip, dst_ip, attack_type, score, packet_id=None):
+        """Добавление алерта и автоматическая блокировка при высоком score (>0.85)"""
+        # Проверка белого списка
+        if self.whitelist.is_whitelisted(src_ip):
             return
         
-        ip = self.blacklist_tree.item(selected[0])['values'][0]
-        self.stats['blacklisted_ips'].discard(ip)
-        self.blacklist_tree.delete(selected[0])
-        
-        # Реальная разблокировка через iptables
-        try:
-            from firewall import Firewall
-            Firewall.unblock_ip(ip)
-            self.log_message(f"[FW] IP {ip} разблокирован в iptables", "green")
-        except ImportError:
-            pass
-        
-        self.log_message(f"[INFO] IP {ip} разблокирован", "green")
-    
-    def add_alert(self, ip, attack_type, score, packet_id=None):
-        """Добавление алерта в таблицу и БД"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        status = "Blocked" if ip in self.stats['blacklisted_ips'] else "Detected"
-        
-        self.alerts_tree.insert("", 0, values=(
-            timestamp, ip, attack_type, status, f"{score:.2f}"
-        ))
-        
-        self.stats['anomalies_detected'] += 1
-        self.alerts_label.config(text=f"Alerts: {self.stats['anomalies_detected']}")
+        # Проверка чёрного списка
+        if self.blacklist.is_blocked(src_ip):
+            return
         
         # Сохраняем в БД
-        self.db.log_alert(ip, attack_type, score, packet_id)
+        self.db.log_alert(src_ip, dst_ip, attack_type, score, packet_id, blocked=0)
         
-        # Если IP не в чёрном списке - блокируем
-        if ip not in self.stats['blacklisted_ips']:
-            self.stats['blacklisted_ips'].add(ip)
-            self.stats['attacks_blocked'] += 1
-            self.blocked_label.config(text=f"Blocked: {self.stats['attacks_blocked']}")
-            self.db.add_to_blacklist(ip, attack_type, duration_minutes=5)
-            
-            # Реальная блокировка через iptables (не для локальных IP)
-            if not ip.startswith(('10.', '192.168.', '172.')):
-                try:
-                    from firewall import Firewall
-                    Firewall.block_ip(ip, duration_seconds=300)
-                    self.log_message(f"[FW] Реальная блокировка {ip} через iptables", "red")
-                except ImportError:
-                    self.log_message(f"[FW] Модуль firewall не найден", "yellow")
-            
-            self.add_to_blacklist(ip, attack_type)
-    
-    def add_to_blacklist(self, ip, reason):
-        """Добавление IP в чёрный список в GUI"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.blacklist_tree.insert("", 0, values=(ip, reason, timestamp))
+        # АВТОМАТИЧЕСКАЯ БЛОКИРОВКА при высоком score (>0.85)
+        # Это касается сигнатурных атак (SQL, XSS, Command Injection) и опасных ML аномалий
+        if score > 0.85:
+            self.log_message(f"[AUTO-BLOCK] {attack_type} от {src_ip} (score: {score:.2f}) - высокая опасность!", "red")
+            self.blacklist.add(src_ip, f"Автоблокировка: {attack_type} (score: {score:.2f})")
+            # Обновляем статус блокировки в алерте
+            self.db.log_alert(src_ip, dst_ip, attack_type, score, packet_id, blocked=1)
+            self.force_refresh_blacklist()
+        
+        # Обновляем группированную таблицу
+        self.force_refresh_alerts()
     
     def train_model_from_db(self):
         """Принудительное обучение модели на данных из БД"""
@@ -610,13 +1045,15 @@ class DarkTraceLight:
         threading.Thread(target=train, daemon=True).start()
     
     def packet_capture_worker(self):
-        """Поток для реального захвата трафика или имитации"""
+        """Поток для реального захвата трафика"""
         if REAL_CAPTURE_AVAILABLE:
             self.log_message("[INFO] Запуск реального захвата трафика", "green")
             self.real_capture_worker()
         else:
-            self.log_message("[INFO] Режим имитации трафика", "yellow")
-            self.simulate_packets_worker()
+            self.log_message("[ERROR] Реальный захват недоступен!", "red")
+            self.log_message("[INFO] Убедитесь, что файл packet_capture.py находится в папке src/", "yellow")
+            while self.monitoring:
+                time.sleep(1)
     
     def real_capture_worker(self):
         """Реальный захват через scapy"""
@@ -629,7 +1066,6 @@ class DarkTraceLight:
             interface = None
             if not self.capture.start_capture(interface=interface):
                 self.log_message("[ERROR] Не удалось запустить захват", "red")
-                self.simulate_packets_worker()
                 return
             
             self.log_message(f"[INFO] Захват запущен", "green")
@@ -642,149 +1078,114 @@ class DarkTraceLight:
                 
         except Exception as e:
             self.log_message(f"[ERROR] Ошибка захвата: {e}", "red")
-            self.simulate_packets_worker()
-    
-    def simulate_packets_worker(self):
-        """Имитация пакетов для демонстрации"""
-        self.log_message("[INFO] Режим имитации трафика", "yellow")
-        
-        test_packets = [
-            ("192.168.1.100", "192.168.1.1", "GET /index.html HTTP/1.1", 512, 80),
-            ("192.168.1.101", "192.168.1.1", "POST /login.php HTTP/1.1", 256, 80),
-            ("192.168.1.50", "192.168.1.1", "GET /page?id=1' OR '1'='1", 128, 80),
-            ("192.168.1.102", "192.168.1.1", "GET /search?q=test", 64, 80),
-            ("10.0.0.5", "192.168.1.1", "<script>alert('xss')</script>", 96, 80),
-        ]
-        
-        packet_index = 0
-        while self.monitoring:
-            pkt = test_packets[packet_index % len(test_packets)]
-            packet_index += 1
-            
-            self.packet_queue.put({
-                'timestamp': time.time(),
-                'src_ip': pkt[0],
-                'dst_ip': pkt[1],
-                'src_port': 54321,
-                'dst_port': pkt[4],
-                'protocol': 6,
-                'length': pkt[3],
-                'payload': pkt[2],
-            })
-            
-            self.stats['packets_total'] += 1
-            self.root.after(0, lambda: self.packets_label.config(text=f"Packets: {self.stats['packets_total']}"))
-            time.sleep(0.5)
     
     def analyze_packet_worker(self):
-        """Поток для анализа пакетов (с белым списком)"""
+        """Поток для анализа пакетов"""
         self.log_message("[INFO] Модуль анализа запущен", "green")
         packet_count = 0
         recent_packets = []
-        
-        # Белый список сетей (Google, Cloudflare, Akamai, Fastly, Microsoft)
-        whitelist_networks = [
-            '8.8.8.8', '1.1.1.1', '8.8.4.4',
-            '74.125.', '173.194.', '172.217.', '64.233.', '142.251.',
-            '108.177.', '34.160.', '34.107.', '34.49.',
-            '151.101.', '150.171.', '23.35.', '20.44.',
-            '13.107.', '13.33.', '3.174.'
-        ]
         
         while self.monitoring:
             try:
                 packet = self.packet_queue.get(timeout=1)
                 packet_count += 1
                 
-                # Сохраняем в историю
                 recent_packets.append(packet)
                 if len(recent_packets) > 500:
                     recent_packets.pop(0)
                 
-                # Логируем пакет в БД
                 packet_id = self.db.log_packet(packet)
                 
                 src_ip = packet.get('src_ip', 'Unknown')
                 dst_ip = packet.get('dst_ip', 'Unknown')
                 payload = packet.get('payload', '').lower()
-                dst_port = packet.get('dst_port', 0)
+                direction = packet.get('direction', 'unknown')
                 
                 # ===== ПРОВЕРКА БЕЛОГО СПИСКА =====
-                is_whitelisted = False
-                for network in whitelist_networks:
-                    if src_ip.startswith(network):
-                        is_whitelisted = True
-                        break
-                
-                # Легитимные порты
-                if dst_port in [80, 443, 53, 22, 8080, 8443, 123]:
-                    is_whitelisted = True
-                
-                # Локальные IP тоже пропускаем
-                if src_ip.startswith(('10.', '192.168.', '172.')):
-                    is_whitelisted = True
-                
-                if is_whitelisted:
-                    if packet_count % 200 == 0:
-                        self.log_message(f"[INFO] Белый список: пропущен {src_ip}:{dst_port}", "gray")
+                if self.whitelist.is_whitelisted(src_ip):
                     continue
                 
-                # == СИГНАТУРНЫЙ АНАЛИЗ ==
+                # ===== ПРОВЕРКА ЧЁРНОГО СПИСКА =====
+                if self.blacklist.is_blocked(src_ip):
+                    continue
+                
+                # ===== СИГНАТУРНЫЙ АНАЛИЗ =====
                 attack_detected = False
                 attack_type = "Normal"
-                signature_score = 0.0
+                score = 0.0
                 
-                sql_patterns = ["' or '1'='1", "'or'1'='1", "union select", "drop table", "1=1'"]
+                # SQL инъекции
+                sql_patterns = [
+                    "' or '1'='1", "'or'1'='1", "union select", "drop table", 
+                    "1=1'", "or 1=1", "';--", "' or 1=1", "select * from",
+                    "information_schema", "order by", "and 1=1", "' union select",
+                    "into outfile", "load_file", "or '1'='1", "or 1=1--"
+                ]
                 for pattern in sql_patterns:
                     if pattern in payload:
                         attack_detected = True
                         attack_type = "SQL Injection"
-                        signature_score = 0.95
+                        score = 0.95
+                        self.log_message(f"[DEBUG] SQL паттерн найден: {pattern}", "magenta")
                         break
                 
+                # XSS атаки
                 if not attack_detected:
-                    xss_patterns = ["<script>", "javascript:", "onerror=", "alert("]
+                    xss_patterns = [
+                        "<script>", "javascript:", "onerror=", "alert(",
+                        "<img", "onload=", "onclick=", "onmouseover",
+                        "prompt(", "confirm(", "<iframe", "<body onload",
+                        "expression(", "vbscript:", "onerror=alert"
+                    ]
                     for pattern in xss_patterns:
                         if pattern in payload:
                             attack_detected = True
                             attack_type = "XSS Attack"
-                            signature_score = 0.92
+                            score = 0.92
+                            self.log_message(f"[DEBUG] XSS паттерн найден: {pattern}", "magenta")
                             break
                 
+                # Command injection
                 if not attack_detected:
-                    cmd_patterns = ["; ls", "; cat", "| whoami", "`id`"]
+                    cmd_patterns = [
+                        "; ls", "; cat", "| whoami", "`id`", "$(id)",
+                        "; id", "|| ls", "&& ls", "| id", "; pwd",
+                        "cat /etc/passwd", "whoami", "uname -a", "; nc",
+                        "bash -i", "sh -i", "| sh", "; sh"
+                    ]
                     for pattern in cmd_patterns:
                         if pattern in payload:
                             attack_detected = True
                             attack_type = "Command Injection"
-                            signature_score = 0.93
+                            score = 0.93
+                            self.log_message(f"[DEBUG] CMD паттерн найден: {pattern}", "magenta")
                             break
                 
-                # == ML АНАЛИЗ (только если нет сигнатурной атаки) ==
+                # ML анализ (только если нет сигнатурной атаки)
                 if not attack_detected and self.anomaly_detector and self.anomaly_detector.is_trained and self.ml_mode_var.get() == "detect":
                     ml_anomaly, ml_score, confidence = self.anomaly_detector.detect(packet, recent_packets)
                     
                     if ml_anomaly and confidence > 0.7:
                         attack_detected = True
                         attack_type = "ML Anomaly"
-                        signature_score = ml_score
-                        self.log_message(f"[ML] Аномалия от {src_ip}: score={ml_score:.3f}, уверенность={confidence:.2f}", "cyan")
+                        score = ml_score
+                        self.log_message(f"[ML] Аномалия от {src_ip}: score={ml_score:.3f}", "cyan")
                 
-                # == ОБУЧЕНИЕ (если нет модели) ==
+                # Обучение ML
                 if self.anomaly_detector and not self.anomaly_detector.is_trained and self.ml_mode_var.get() != "detect":
                     trained = self.anomaly_detector.add_packet_to_buffer(packet)
                     if trained:
-                        self.log_message("[ML] Модель обучена на собранных данных! Переключитесь в режим Detect.", "green")
+                        self.log_message("[ML] Модель обучена! Переключитесь в режим Detect.", "green")
                         self.root.after(0, lambda: self.ml_mode_var.set("detect"))
                 
-                # == РЕАКЦИЯ НА АТАКУ ==
+                # Реакция на атаку
                 if attack_detected and src_ip not in ['Unknown', '127.0.0.1', '::1']:
-                    self.root.after(0, lambda ip=src_ip, at=attack_type, sc=signature_score, pid=packet_id: 
-                                   self.add_alert(ip, at, sc, pid))
-                    self.log_message(f"[ALERT] {attack_type} от {src_ip} (score: {signature_score:.2f})", "orange")
+                    self.root.after(0, lambda sip=src_ip, dip=dst_ip, at=attack_type, sc=score, pid=packet_id: 
+                                   self.add_alert_and_block(sip, dip, at, sc, pid))
+                    self.log_message(f"[ALERT] {attack_type} от {src_ip} -> {dst_ip} (score: {score:.2f})", "orange")
                 
-                # Обновляем счётчик пакетов
-                if packet_count % 100 == 0:
+                # Обновление счётчика
+                if packet_count % 50 == 0:
                     db_stats = self.db.get_stats()
                     self.root.after(0, lambda: self.packets_label.config(text=f"Packets: {db_stats[0]}"))
                 
@@ -801,15 +1202,6 @@ class DarkTraceLight:
             return
         
         self.monitoring = True
-        self.start_time = time.time()
-        
-        # Сброс счётчиков
-        self.stats = {
-            'packets_total': 0,
-            'anomalies_detected': 0,
-            'attacks_blocked': 0,
-            'blacklisted_ips': set()
-        }
         
         self.capture_thread = threading.Thread(target=self.packet_capture_worker, daemon=True)
         self.analysis_thread = threading.Thread(target=self.analyze_packet_worker, daemon=True)
@@ -821,10 +1213,6 @@ class DarkTraceLight:
         self.stop_btn.config(state=tk.NORMAL)
         self.status_label.config(text="● Monitoring Active", foreground="green")
         self.train_btn.config(state=tk.NORMAL)
-        
-        # Очищаем старые алерты
-        for item in self.alerts_tree.get_children():
-            self.alerts_tree.delete(item)
         
         self.log_message("[INFO] Система мониторинга запущена", "green")
     
@@ -858,27 +1246,32 @@ class DarkTraceLight:
         """Периодическое обновление GUI"""
         db_stats = self.db.get_stats()
         self.packets_label.config(text=f"Packets: {db_stats[0]}")
-        self.alerts_label.config(text=f"Alerts: {db_stats[1]}")
-        self.blocked_label.config(text=f"Blocked: {db_stats[2]}")
+        self.force_refresh_blacklist()
         
-        self.root.after(100, self.update_gui)
+        self.root.after(3000, self.update_gui)
 
 
 def main():
     """Точка входа"""
+    print("[DEBUG] Создание корневого окна tkinter...")
     root = tk.Tk()
+    print("[DEBUG] Корневое окно создано, создание приложения...")
     app = DarkTraceLight(root)
+    print("[DEBUG] Приложение создано, запуск mainloop...")
     
     def on_closing():
+        print("[DEBUG] Закрытие окна...")
         if app.monitoring:
             app.stop_monitoring()
         root.destroy()
     
     root.protocol("WM_DELETE_WINDOW", on_closing)
     root.mainloop()
+    print("[DEBUG] mainloop завершён")
 
 
 if __name__ == "__main__":
+    print("[DEBUG] Программа запущена")
     if sys.platform.startswith('linux') and os.geteuid() != 0:
         print("\n" + "="*60)
         print("⚠️  ВНИМАНИЕ: Для захвата реального трафика нужны root права")

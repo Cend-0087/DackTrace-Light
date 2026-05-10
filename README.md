@@ -1,19 +1,15 @@
 # DarkTrace Light
 
-Open Source Network Anomaly Detection System
+## Быстрый старт
 
-## Features
-- Real-time packet capture
-- Signature-based attack detection (SQLi, XSS, CMD injection)
-- ML-based anomaly detection (Isolation Forest)
-- Real-time blocking via iptables
-
-## Installation
 ```bash
-git clone <repo>
+# Клонирование репозитория
+git clone https://github.com/your/darktrace-light
 cd darktrace-light
-pip install -r requirements.txt
 
+# Установка (один раз)
+chmod +x setup.sh run.sh
+./setup.sh
 
-
-sudo /home/kali/Desktop/DarkTrace\ Light/.venv/bin/python /home/kali/Desktop/DarkTrace\ Light/main.py
+# Запуск
+sudo ./run.sh

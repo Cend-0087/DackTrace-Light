@@ -179,7 +179,6 @@ class BlacklistManager:
             return
         self.ips[ip] = {'reason': reason, 'blocked_at': datetime.now().isoformat()}
         self.save()
-        # Реальная блокировка через iptables
         try:
             subprocess.run(f"iptables -I INPUT 1 -s {ip} -j DROP", shell=True, stderr=subprocess.DEVNULL)
             subprocess.run(f"iptables -I OUTPUT 1 -d {ip} -j DROP", shell=True, stderr=subprocess.DEVNULL)
@@ -191,7 +190,6 @@ class BlacklistManager:
         if ip in self.ips:
             del self.ips[ip]
             self.save()
-            # Реальная разблокировка через iptables
             try:
                 subprocess.run(f"iptables -D INPUT -s {ip} -j DROP", shell=True, stderr=subprocess.DEVNULL)
                 subprocess.run(f"iptables -D OUTPUT -d {ip} -j DROP", shell=True, stderr=subprocess.DEVNULL)
@@ -339,19 +337,14 @@ def get_ip_info(ip):
     
     # Проверка на приватные IP
     private_ranges = [
-        ('10.', 'Private'),
-        ('192.168.', 'Private'),
+        ('10.', 'Private'), ('192.168.', 'Private'),
         ('172.16.', 'Private'), ('172.17.', 'Private'), ('172.18.', 'Private'),
         ('172.19.', 'Private'), ('172.20.', 'Private'), ('172.21.', 'Private'),
         ('172.22.', 'Private'), ('172.23.', 'Private'), ('172.24.', 'Private'),
         ('172.25.', 'Private'), ('172.26.', 'Private'), ('172.27.', 'Private'),
         ('172.28.', 'Private'), ('172.29.', 'Private'), ('172.30.', 'Private'),
-        ('172.31.', 'Private'),
-        ('127.', 'Loopback'),
-        ('0.', 'Invalid'),
-        ('224.', 'Multicast'),
-        ('240.', 'Reserved'),
-        ('255.255.255.255', 'Broadcast'),
+        ('172.31.', 'Private'), ('127.', 'Loopback'), ('0.', 'Invalid'),
+        ('224.', 'Multicast'), ('240.', 'Reserved'), ('255.255.255.255', 'Broadcast'),
     ]
     
     for prefix, desc in private_ranges:
@@ -367,14 +360,11 @@ def get_ip_info(ip):
     except:
         pass
     
-    # Определение ISP по ASN (без внешних запросов)
+    # Определение ISP
     known_ips = {
-        '8.8.8.8': 'Google (Public DNS)',
-        '8.8.4.4': 'Google (Public DNS)',
-        '1.1.1.1': 'Cloudflare (Public DNS)',
-        '1.0.0.1': 'Cloudflare (Public DNS)',
-        '9.9.9.9': 'Quad9 (Public DNS)',
-        '208.67.222.222': 'OpenDNS',
+        '8.8.8.8': 'Google (Public DNS)', '8.8.4.4': 'Google (Public DNS)',
+        '1.1.1.1': 'Cloudflare (Public DNS)', '1.0.0.1': 'Cloudflare (Public DNS)',
+        '9.9.9.9': 'Quad9 (Public DNS)', '208.67.222.222': 'OpenDNS',
         '208.67.220.220': 'OpenDNS',
     }
     
@@ -383,7 +373,6 @@ def get_ip_info(ip):
             info['isp'] = name
             return info
     
-    # Определение по первым октетам
     if ip.startswith('151.101.'):
         info['isp'] = 'Fastly (CDN)'
     elif ip.startswith('74.125.') or ip.startswith('173.194.') or ip.startswith('172.217.'):
@@ -527,6 +516,16 @@ class DarkTraceLight:
         self.train_btn = ttk.Button(control_frame, text="🧠 Train Model from DB", 
                                     command=self.train_model_from_db)
         self.train_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Кнопка очистки БД
+        self.clear_db_btn = ttk.Button(control_frame, text="🗑️ Clear DB (keep lists)", 
+                                        command=self.clear_database_keep_lists)
+        self.clear_db_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Кнопка сброса модели
+        self.reset_model_btn = ttk.Button(control_frame, text="🔄 Reset Model", 
+                                           command=self.reset_ml_model)
+        self.reset_model_btn.pack(side=tk.LEFT, padx=5)
         
         # Статусная строка
         self.status_label = ttk.Label(control_frame, text="● Stopped", foreground="red")
@@ -680,13 +679,72 @@ class DarkTraceLight:
     
     def setup_stats_tab(self):
         """Настройка вкладки со статистикой"""
-        label = ttk.Label(self.stats_frame, text="Network Statistics Dashboard", font=('Arial', 14))
-        label.pack(pady=20)
+        # Основной фрейм с прокруткой
+        canvas = tk.Canvas(self.stats_frame, bg='#1e1e1e', highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self.stats_frame, orient=tk.VERTICAL, command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
         
-        self.stats_text = tk.Text(self.stats_frame, bg='#1e1e1e', fg='#ffffff', height=20)
-        self.stats_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
         
-        self.update_stats_display()
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Заголовок
+        title = ttk.Label(scrollable_frame, text="DARKTRACE LIGHT STATISTICS", 
+                         font=('Arial', 16, 'bold'), foreground='#0e639c')
+        title.pack(pady=20)
+        
+        # Создаём карточки с данными
+        stats_frame_inner = ttk.Frame(scrollable_frame)
+        stats_frame_inner.pack(pady=10)
+        
+        # Карточка 1: Общая статистика
+        card1 = ttk.LabelFrame(stats_frame_inner, text="📊 Общая статистика", padding=15)
+        card1.pack(fill=tk.X, padx=20, pady=10)
+        
+        self.stat_packets = ttk.Label(card1, text="Packets: 0", font=('Consolas', 12), foreground='#00ff00')
+        self.stat_packets.pack(anchor=tk.W, pady=2)
+        
+        self.stat_alerts = ttk.Label(card1, text="Alerts: 0", font=('Consolas', 12), foreground='#ffaa00')
+        self.stat_alerts.pack(anchor=tk.W, pady=2)
+        
+        self.stat_blocked = ttk.Label(card1, text="Blocked IPs: 0", font=('Consolas', 12), foreground='#ff5555')
+        self.stat_blocked.pack(anchor=tk.W, pady=2)
+        
+        # Карточка 2: Списки
+        card2 = ttk.LabelFrame(stats_frame_inner, text="📋 Списки", padding=15)
+        card2.pack(fill=tk.X, padx=20, pady=10)
+        
+        self.stat_wl_ips = ttk.Label(card2, text="Whitelist IPs: 0", font=('Consolas', 12))
+        self.stat_wl_ips.pack(anchor=tk.W, pady=2)
+        
+        self.stat_wl_nets = ttk.Label(card2, text="Whitelist Networks: 0", font=('Consolas', 12))
+        self.stat_wl_nets.pack(anchor=tk.W, pady=2)
+        
+        # Карточка 3: Состояние
+        card3 = ttk.LabelFrame(stats_frame_inner, text="⚙️ Состояние", padding=15)
+        card3.pack(fill=tk.X, padx=20, pady=10)
+        
+        self.stat_ml = ttk.Label(card3, text="ML Status: COLLECTING", font=('Consolas', 12))
+        self.stat_ml.pack(anchor=tk.W, pady=2)
+        
+        self.stat_mode = ttk.Label(card3, text="Mode: detect", font=('Consolas', 12))
+        self.stat_mode.pack(anchor=tk.W, pady=2)
+        
+        self.stat_monitoring = ttk.Label(card3, text="Monitoring: STOPPED", font=('Consolas', 12), foreground='#ff5555')
+        self.stat_monitoring.pack(anchor=tk.W, pady=2)
+        
+        self.stat_capture = ttk.Label(card3, text="Capture Mode: REAL", font=('Consolas', 12))
+        self.stat_capture.pack(anchor=tk.W, pady=2)
+        
+        # Запускаем обновление статистики
+        self.update_stats_display_v2()
     
     # ==================== МЕТОДЫ БЕЛОГО СПИСКА ====================
     
@@ -726,7 +784,7 @@ class DarkTraceLight:
         self.force_refresh_whitelist()
     
     def force_refresh_whitelist(self):
-        """Принудительное обновление таблицы"""
+        """Принудительное обновление таблицы белого списка"""
         for item in self.whitelist_tree.get_children():
             self.whitelist_tree.delete(item)
         data = self.whitelist.get_all()
@@ -751,7 +809,7 @@ class DarkTraceLight:
     # ==================== МЕТОДЫ АЛЕРТОВ ====================
     
     def force_refresh_alerts(self):
-        """Принудительное обновление таблицы"""
+        """Принудительное обновление таблицы алертов"""
         for item in self.alerts_tree.get_children():
             self.alerts_tree.delete(item)
         
@@ -765,13 +823,26 @@ class DarkTraceLight:
             ))
     
     def force_refresh_blacklist(self):
-        """Принудительное обновление таблицы чёрного списка"""
+        """Принудительное обновление таблицы чёрного списка с сохранением выделения"""
+        # Сохраняем выделенные IP
+        selected_items = []
+        for item in self.blacklist_tree.selection():
+            values = self.blacklist_tree.item(item, 'values')
+            if values:
+                selected_items.append(values[0])
+        
         for item in self.blacklist_tree.get_children():
             self.blacklist_tree.delete(item)
         
         for ip, data in self.blacklist.get_all().items():
             blocked_at = data.get('blocked_at', '')[:19]
             self.blacklist_tree.insert('', 'end', values=(ip, data['reason'], blocked_at))
+        
+        # Восстанавливаем выделение
+        for item in self.blacklist_tree.get_children():
+            values = self.blacklist_tree.item(item, 'values')
+            if values and values[0] in selected_items:
+                self.blacklist_tree.selection_add(item)
         
         self.blocked_label.config(text=f"Blocked: {len(self.blacklist.get_all())}")
     
@@ -967,36 +1038,96 @@ class DarkTraceLight:
         self.log_text.delete(1.0, tk.END)
         self.log_message("[INFO] Логи очищены", "gray")
     
-    def update_stats_display(self):
-        """Обновление отображения статистики"""
+    def update_stats_display_v2(self):
+        """Обновление отображения статистики (карточки)"""
         db_stats = self.db.get_stats()
         wl_data = self.whitelist.get_all()
         bl_count = len(self.blacklist.get_all())
         
         ml_status = "ACTIVE" if self.anomaly_detector and self.anomaly_detector.is_trained else "COLLECTING"
+        ml_color = '#00ff00' if ml_status == "ACTIVE" else '#ffaa00'
         
-        stats_text = f"""
-╔══════════════════════════════════════════════╗
-║         DARKTRACE LIGHT STATISTICS           ║
-╠══════════════════════════════════════════════╣
-║ Total Packets:        {db_stats[0]:<30} ║
-║ Total Alerts:         {db_stats[1]:<30} ║
-║ Blocked IPs:          {bl_count:<30} ║
-╠══════════════════════════════════════════════╣
-║ Whitelist IPs:        {len(wl_data['ips']):<30} ║
-║ Whitelist Networks:   {len(wl_data['networks']):<30} ║
-╠══════════════════════════════════════════════╣
-║ ML Status:            {ml_status:<30} ║
-║ Mode:                 {self.ml_mode_var.get():<30} ║
-╠══════════════════════════════════════════════╣
-║ Monitoring Active:    {'YES' if self.monitoring else 'NO':<30} ║
-║ Capture Mode:         {'REAL' if REAL_CAPTURE_AVAILABLE else 'DEMO':<30} ║
-╚══════════════════════════════════════════════╝
-"""
-        self.stats_text.delete(1.0, tk.END)
-        self.stats_text.insert(1.0, stats_text)
+        monitoring_status = "ACTIVE" if self.monitoring else "STOPPED"
+        monitoring_color = '#00ff00' if self.monitoring else '#ff5555'
         
-        self.root.after(3000, self.update_stats_display)
+        # Обновляем карточки
+        self.stat_packets.config(text=f"📦 Packets: {db_stats[0]}")
+        self.stat_alerts.config(text=f"⚠️ Alerts: {db_stats[1]}")
+        self.stat_blocked.config(text=f"🚫 Blocked IPs: {bl_count}")
+        
+        self.stat_wl_ips.config(text=f"✅ Whitelist IPs: {len(wl_data['ips'])}")
+        self.stat_wl_nets.config(text=f"🌐 Whitelist Networks: {len(wl_data['networks'])}")
+        
+        self.stat_ml.config(text=f"🧠 ML Status: {ml_status}", foreground=ml_color)
+        self.stat_mode.config(text=f"🎯 Mode: {self.ml_mode_var.get()}")
+        self.stat_monitoring.config(text=f"🟢 Monitoring: {monitoring_status}", foreground=monitoring_color)
+        self.stat_capture.config(text=f"📡 Capture Mode: {'REAL' if REAL_CAPTURE_AVAILABLE else 'DEMO'}")
+        
+        # Запланировать следующее обновление
+        self.root.after(3000, self.update_stats_display_v2)
+    
+    # ==================== УПРАВЛЕНИЕ БД И МОДЕЛЬЮ ====================
+    
+    def clear_database_keep_lists(self):
+        """Очистка БД с сохранением белого и чёрного списков"""
+        result = messagebox.askyesno(
+            "Подтверждение", 
+            "Очистить БД?\n\n"
+            "Будут удалены:\n"
+            "• Все пакеты\n"
+            "• Все алерты\n\n"
+            "Будут сохранены:\n"
+            "• Белый список IP и сетей\n"
+            "• Чёрный список IP\n\n"
+            "Продолжить?"
+        )
+        if not result:
+            return
+        
+        self.log_message("[DB] Очистка базы данных...", "yellow")
+        
+        import sqlite3
+        with sqlite3.connect(self.db.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM packets")
+            cursor.execute("DELETE FROM alerts")
+            cursor.execute("DELETE FROM sqlite_sequence WHERE name IN ('packets', 'alerts')")
+            conn.commit()
+        
+        self.force_refresh_alerts()
+        self.log_message("[DB] База данных очищена (списки сохранены)", "green")
+        messagebox.showinfo("Готово", "База данных очищена.\nБелый и чёрный списки сохранены.")
+    
+    def reset_ml_model(self):
+        """Сброс ML модели (удаление файла)"""
+        result = messagebox.askyesno(
+            "Подтверждение", 
+            "Сбросить ML модель?\n\n"
+            "Это удалит обученную модель.\n"
+            "Программа перейдёт в режим сбора данных для обучения.\n\n"
+            "Продолжить?"
+        )
+        if not result:
+            return
+        
+        import os
+        from pathlib import Path
+        
+        model_path = Path(__file__).parent / "models" / "isolation_forest.pkl"
+        if model_path.exists():
+            os.remove(model_path)
+            self.log_message("[ML] Модель удалена", "yellow")
+        else:
+            self.log_message("[ML] Модель не найдена", "yellow")
+        
+        if self.anomaly_detector:
+            self.anomaly_detector.is_trained = False
+            self.anomaly_detector.model = None
+            self.anomaly_detector.training_buffer.clear()
+        
+        self.ml_mode_var.set("train")
+        self.log_message("[ML] Режим переключён на Train. Собирайте данные для обучения.", "cyan")
+        messagebox.showinfo("Готово", "ML модель сброшена.\nПрограмма теперь в режиме сбора данных.")
     
     def add_alert_and_block(self, src_ip, dst_ip, attack_type, score, packet_id=None):
         """Добавление алерта и автоматическая блокировка при высоком score (>0.85)"""
@@ -1012,7 +1143,6 @@ class DarkTraceLight:
         self.db.log_alert(src_ip, dst_ip, attack_type, score, packet_id, blocked=0)
         
         # АВТОМАТИЧЕСКАЯ БЛОКИРОВКА при высоком score (>0.85)
-        # Это касается сигнатурных атак (SQL, XSS, Command Injection) и опасных ML аномалий
         if score > 0.85:
             self.log_message(f"[AUTO-BLOCK] {attack_type} от {src_ip} (score: {score:.2f}) - высокая опасность!", "red")
             self.blacklist.add(src_ip, f"Автоблокировка: {attack_type} (score: {score:.2f})")
@@ -1029,6 +1159,12 @@ class DarkTraceLight:
             self.log_message("[ML] Детектор не инициализирован", "red")
             return
         
+        db_stats = self.db.get_stats()
+        if db_stats[0] < 100:
+            self.log_message(f"[ML] Недостаточно данных: {db_stats[0]} пакетов, нужно минимум 100", "red")
+            messagebox.showwarning("Warning", f"Недостаточно данных в БД.\nСобрано {db_stats[0]} пакетов, нужно минимум 100.")
+            return
+        
         self.log_message("[ML] Запуск обучения на данных из БД...", "yellow")
         
         def train():
@@ -1039,8 +1175,9 @@ class DarkTraceLight:
             )
             if success:
                 self.root.after(0, lambda: self.log_message("[ML] Модель успешно обучена!", "green"))
+                self.root.after(0, lambda: messagebox.showinfo("Success", "ML модель обучена!\nТеперь переключитесь в режим Detect вручную."))
             else:
-                self.root.after(0, lambda: self.log_message("[ML] Ошибка обучения. Недостаточно данных?", "red"))
+                self.root.after(0, lambda: self.log_message("[ML] Ошибка обучения. Недостаточно чистых данных?", "red"))
         
         threading.Thread(target=train, daemon=True).start()
     
@@ -1099,7 +1236,6 @@ class DarkTraceLight:
                 src_ip = packet.get('src_ip', 'Unknown')
                 dst_ip = packet.get('dst_ip', 'Unknown')
                 payload = packet.get('payload', '').lower()
-                direction = packet.get('direction', 'unknown')
                 
                 # ===== ПРОВЕРКА БЕЛОГО СПИСКА =====
                 if self.whitelist.is_whitelisted(src_ip):
@@ -1126,7 +1262,6 @@ class DarkTraceLight:
                         attack_detected = True
                         attack_type = "SQL Injection"
                         score = 0.95
-                        self.log_message(f"[DEBUG] SQL паттерн найден: {pattern}", "magenta")
                         break
                 
                 # XSS атаки
@@ -1142,7 +1277,6 @@ class DarkTraceLight:
                             attack_detected = True
                             attack_type = "XSS Attack"
                             score = 0.92
-                            self.log_message(f"[DEBUG] XSS паттерн найден: {pattern}", "magenta")
                             break
                 
                 # Command injection
@@ -1158,10 +1292,9 @@ class DarkTraceLight:
                             attack_detected = True
                             attack_type = "Command Injection"
                             score = 0.93
-                            self.log_message(f"[DEBUG] CMD паттерн найден: {pattern}", "magenta")
                             break
                 
-                # ML анализ (только если нет сигнатурной атаки)
+                # ML анализ
                 if not attack_detected and self.anomaly_detector and self.anomaly_detector.is_trained and self.ml_mode_var.get() == "detect":
                     ml_anomaly, ml_score, confidence = self.anomaly_detector.detect(packet, recent_packets)
                     
@@ -1171,12 +1304,12 @@ class DarkTraceLight:
                         score = ml_score
                         self.log_message(f"[ML] Аномалия от {src_ip}: score={ml_score:.3f}", "cyan")
                 
-                # Обучение ML
+                # Обучение ML (только сбор данных, БЕЗ АВТОМАТИЧЕСКОГО ПЕРЕКЛЮЧЕНИЯ)
                 if self.anomaly_detector and not self.anomaly_detector.is_trained and self.ml_mode_var.get() != "detect":
                     trained = self.anomaly_detector.add_packet_to_buffer(packet)
                     if trained:
-                        self.log_message("[ML] Модель обучена! Переключитесь в режим Detect.", "green")
-                        self.root.after(0, lambda: self.ml_mode_var.set("detect"))
+                        self.log_message("[ML] Модель обучена на собранных данных! Нажмите 'Train Model from DB' для сохранения.", "green")
+                        # НЕ переключаем режим автоматически - пользователь сам решит
                 
                 # Реакция на атаку
                 if attack_detected and src_ip not in ['Unknown', '127.0.0.1', '::1']:
@@ -1213,6 +1346,8 @@ class DarkTraceLight:
         self.stop_btn.config(state=tk.NORMAL)
         self.status_label.config(text="● Monitoring Active", foreground="green")
         self.train_btn.config(state=tk.NORMAL)
+        self.clear_db_btn.config(state=tk.NORMAL)
+        self.reset_model_btn.config(state=tk.NORMAL)
         
         self.log_message("[INFO] Система мониторинга запущена", "green")
     
@@ -1238,7 +1373,9 @@ class DarkTraceLight:
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.status_label.config(text="● Stopped", foreground="red")
-        self.train_btn.config(state=tk.DISABLED)
+        self.train_btn.config(state=tk.NORMAL)
+        self.clear_db_btn.config(state=tk.NORMAL)
+        self.reset_model_btn.config(state=tk.NORMAL)
         
         self.log_message("[INFO] Система мониторинга остановлена", "yellow")
     
@@ -1246,6 +1383,8 @@ class DarkTraceLight:
         """Периодическое обновление GUI"""
         db_stats = self.db.get_stats()
         self.packets_label.config(text=f"Packets: {db_stats[0]}")
+        
+        # Обновляем чёрный список
         self.force_refresh_blacklist()
         
         self.root.after(3000, self.update_gui)

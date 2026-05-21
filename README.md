@@ -13,11 +13,3 @@ chmod +x setup.sh run.sh
 
 # Запуск
 sudo ./run.sh
-
-┌──(kali㉿kali)-[~/Desktop/DarkTrace Light]
-└─$ git push                   
-Username for 'https://github.com': Cend-0087
-Password for 'https://Cend-0087@github.com': 
-remote: Invalid username or token. Password authentication is not supported for Git operations.
-fatal: Authentication failed for 'https://github.com/Cend-0087/DackTrace-Light.git/'
-
